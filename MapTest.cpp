@@ -5,6 +5,12 @@
 #include <algorithm>
 #include <random>
 
+// Abseil
+#include "absl/container/flat_hash_map.h"
+
+// Robin Hood
+#include "robin_hood.h"
+
 // Dummy handler function
 using HandlerFn = void(*)(int&);
 void dummyHandler(int& counter) { ++counter; }
@@ -67,6 +73,36 @@ static void BM_UnorderedMapLookup(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_UnorderedMapLookup);
+
+// -------------------- absl::flat_hash_map --------------------
+static void BM_AbslFlatHashMapLookup(benchmark::State& state) {
+    absl::flat_hash_map<int, HandlerFn> am;
+    for (auto fid : fid_values) am.emplace(fid, dummyHandler);
+
+    int counter = 0;
+    for (auto _ : state) {
+        int fid = fid_values[state.iterations() % fid_values.size()];
+        auto it = am.find(fid);
+        if (it != am.end()) it->second(counter);
+        benchmark::DoNotOptimize(counter);
+    }
+}
+BENCHMARK(BM_AbslFlatHashMapLookup);
+
+// -------------------- robin_hood::unordered_map --------------------
+static void BM_RobinHoodLookup(benchmark::State& state) {
+    robin_hood::unordered_map<int, HandlerFn> rh;
+    for (auto fid : fid_values) rh.emplace(fid, dummyHandler);
+
+    int counter = 0;
+    for (auto _ : state) {
+        int fid = fid_values[state.iterations() % fid_values.size()];
+        auto it = rh.find(fid);
+        if (it != rh.end()) it->second(counter);
+        benchmark::DoNotOptimize(counter);
+    }
+}
+BENCHMARK(BM_RobinHoodLookup);
 
 // -------------------- main --------------------
 BENCHMARK_MAIN();
