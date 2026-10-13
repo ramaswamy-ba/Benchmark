@@ -217,6 +217,120 @@ int main() {
 
 
 
+Multithread event
+
+
+#include <iostream>
+#include <cstdint>
+#include <array>
+#include <atomic>
+#include <type_traits>
+#include <utility>
+
+// ============================================================================
+// 1. OPTION 1: Lock-Free Atomic Bitmask Strategy (MaxEvents <= 64)
+// ============================================================================
+template <size_t MaxEvents>
+class AtomicBitmaskStrategy {
+private:
+    // Atomic bitmask to support concurrent thread notifications
+    std::atomic<uint64_t> active_events{0};
+
+public:
+    // Thread-safe Notification: O(1) Lock-free bitwise OR
+    inline void notify(size_t event_id) {
+        // Release order ensures any data writes prior to notify() are visible to the consumer
+        active_events.fetch_or(1ULL << event_id, std::memory_order_release);
+    }
+
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        // Atomic exchange grabs ALL active events and zeroes the bitmask in 1 instruction
+        // Acquire order pairs with fetch_or's release to guarantee memory visibility
+        uint64_t mask = active_events.exchange(0, std::memory_order_acquire);
+
+        while (mask > 0) {
+            int event_id = __builtin_ctzll(mask);
+            process_event(event_id);
+            mask &= (mask - 1); 
+        }
+    }
+};
+
+// ============================================================================
+// 2. OPTION 2: Lock-Free Sparse-Dense Strategy (MaxEvents > 64)
+// ============================================================================
+template <size_t MaxEvents>
+class AtomicSparseDenseStrategy {
+private:
+    // Atomic flags to prevent duplicate entries in the sequential queue
+    std::array<std::atomic<bool>, MaxEvents> is_queued{};
+    
+    // Contiguous queue array (only written to by producers, read by consumer)
+    std::array<size_t, MaxEvents> active_ids;
+    
+    // Atomic tracking index for where to append next
+    std::atomic<size_t> active_count{0};
+
+public:
+    inline void notify(size_t event_id) {
+        // 1. Atomically check-and-set to ensure only 1 thread queues this exact event ID
+        bool expected = false;
+        if (is_queued[event_id].compare_exchange_strong(expected, true, 
+                                                        std::memory_order_relaxed)) {
+            // 2. Fetch-and-add safely reserves a unique sequential slot in our dense array
+            size_t slot = active_count.fetch_add(1, std::memory_order_release);
+            active_ids[slot] = event_id;
+        }
+    }
+
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        // Grabs the current snapshot size and resets the counter to 0 in one atomic step
+        size_t count = active_count.exchange(0, std::memory_order_acquire);
+
+        for (size_t i = 0; i < count; ++i) {
+            size_t event_id = active_ids[i];
+            
+            // Allow this event ID to be queued again by producers in the next cycle
+            is_queued[event_id].store(false, std::memory_order_relaxed);
+            
+            process_event(event_id);
+        }
+    }
+};
+
+// ============================================================================
+// 3. THE UNIFIED GENERIC SYSTEM
+// ============================================================================
+template <size_t MaxEvents>
+class GenericMultiThreadedEventSystem {
+private:
+    using Strategy = std::conditional_t<
+        (MaxEvents <= 64),
+        AtomicBitmaskStrategy<MaxEvents>,
+        AtomicSparseDenseStrategy<MaxEvents>
+    >;
+
+    Strategy strategy;
+
+public:
+    // Thread-safe, non-blocking notification
+    inline void notify(size_t event_id) {
+        if (event_id >= MaxEvents) [[unlikely]] return; 
+        strategy.notify(event_id);
+    }
+
+    // Thread-safe consumption (Meant to be invoked by 1 designated consumer thread)
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        strategy.consume_all(std::forward<Func>(process_event));
+    }
+};
+
+
+
+
 
 
 
