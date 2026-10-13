@@ -328,6 +328,112 @@ public:
     }
 };
 
+cach aligned
+
+#include <iostream>
+#include <cstdint>
+#include <array>
+#include <atomic>
+#include <type_traits>
+#include <utility>
+
+// Standard hardware cache line size for modern x86/ARM processors
+constexpr size_t CACHE_LINE_SIZE = 64; 
+
+// ============================================================================
+// 1. OPTION 1: Cache-Aligned Atomic Bitmask Strategy (MaxEvents <= 64)
+// ============================================================================
+template <size_t MaxEvents>
+class alignas(CACHE_LINE_SIZE) AtomicBitmaskStrategy {
+private:
+    // Aligned to its own cache line to prevent neighboring objects from sharing space
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> active_events{0};
+
+public:
+    inline void notify(size_t event_id) {
+        active_events.fetch_or(1ULL << event_id, std::memory_order_release);
+    }
+
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        uint64_t mask = active_events.exchange(0, std::memory_order_acquire);
+        while (mask > 0) {
+            int event_id = __builtin_ctzll(mask);
+            process_event(event_id);
+            mask &= (mask - 1); 
+        }
+    }
+};
+
+// ============================================================================
+// 2. OPTION 2: Cache-Aligned Sparse-Dense Strategy (MaxEvents > 64)
+// ============================================================================
+template <size_t MaxEvents>
+class alignas(CACHE_LINE_SIZE) AtomicSparseDenseStrategy {
+private:
+    // 1. Contiguous lookup table. Read/Write by producers; read by consumer.
+    // We isolate this massive block onto its own cache lines.
+    alignas(CACHE_LINE_SIZE) std::array<std::atomic<bool>, MaxEvents> is_queued{};
+    
+    // 2. Queue vector storing triggered events. 
+    // Isolate completely to prevent producer contention with counter updates.
+    alignas(CACHE_LINE_SIZE) std::array<size_t, MaxEvents> active_ids;
+    
+    // 3. Hot tracking index. 
+    // This atomic integer is highly contested (fetch_add by producers, exchange by consumer).
+    // It MUST sit isolated on its own cache line to prevent fatal cache-line bouncing.
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> active_count{0};
+
+public:
+    inline void notify(size_t event_id) {
+        bool expected = false;
+        // Check-and-set relies on local cache layout lines
+        if (is_queued[event_id].compare_exchange_strong(expected, true, 
+                                                        std::memory_order_relaxed)) {
+            // Hot index modification completely isolated to its own 64-byte boundary
+            size_t slot = active_count.fetch_add(1, std::memory_order_release);
+            active_ids[slot] = event_id;
+        }
+    }
+
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        // Consumer grabs the snapshot counter cleanly without disturbing index writers
+        size_t count = active_count.exchange(0, std::memory_order_acquire);
+
+        for (size_t i = 0; i < count; ++i) {
+            size_t event_id = active_ids[i];
+            is_queued[event_id].store(false, std::memory_order_relaxed);
+            process_event(event_id);
+        }
+    }
+};
+
+// ============================================================================
+// 3. THE UNIFIED GENERIC SYSTEM
+// ============================================================================
+template <size_t MaxEvents>
+class alignas(CACHE_LINE_SIZE) GenericMultiThreadedEventSystem {
+private:
+    using Strategy = std::conditional_t<
+        (MaxEvents <= 64),
+        AtomicBitmaskStrategy<MaxEvents>,
+        AtomicSparseDenseStrategy<MaxEvents>
+    >;
+
+    Strategy strategy;
+
+public:
+    inline void notify(size_t event_id) {
+        if (event_id >= MaxEvents) [[unlikely]] return; 
+        strategy.notify(event_id);
+    }
+
+    template <typename Func>
+    inline void consume_all(Func&& process_event) {
+        strategy.consume_all(std::forward<Func>(process_event));
+    }
+};
 
 
 
